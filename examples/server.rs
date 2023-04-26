@@ -26,7 +26,7 @@ use std::{
 };
 
 use futures_channel::mpsc::{unbounded, UnboundedSender};
-use futures_util::{future, pin_mut, stream::TryStreamExt, StreamExt};
+use futures_util::{future, pin_mut, stream::TryStreamExt, SinkExt, StreamExt};
 
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::tungstenite::protocol::Message;
@@ -46,7 +46,16 @@ async fn handle_connection(peer_map: PeerMap, raw_stream: TcpStream, addr: Socke
     let (tx, rx) = unbounded();
     peer_map.lock().unwrap().insert(addr, tx);
 
-    let (outgoing, incoming) = ws_stream.split();
+    let (mut outgoing, mut incoming) = ws_stream.split();
+    while let Some(Ok(_)) = incoming.next().await {
+        for _ in 0..10 {
+            // In case of any websocket error, we exit.
+            println!("Sending binary");
+            outgoing.send(Message::Binary(vec![1, 2, 3])).await.unwrap();
+
+            tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+        }
+    }
 
     let broadcast_incoming = incoming.try_for_each(|msg| {
         println!("Received a message from {}: {}", addr, msg.to_text().unwrap());

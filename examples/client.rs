@@ -10,50 +10,79 @@
 //!
 //! You can use this example together with the `server` example.
 
-use std::env;
-
-use futures_util::{future, pin_mut, StreamExt};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use futures_util::{SinkExt, StreamExt};
+use std::ops::ControlFlow;
+use std::time::Instant;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 
 #[tokio::main]
 async fn main() {
-    let connect_addr =
-        env::args().nth(1).unwrap_or_else(|| panic!("this program requires at least one argument"));
-
-    let url = url::Url::parse(&connect_addr).unwrap();
-
-    let (stdin_tx, stdin_rx) = futures_channel::mpsc::unbounded();
-    tokio::spawn(read_stdin(stdin_tx));
+    let url = url::Url::parse("ws://localhost:8080").unwrap();
 
     let (ws_stream, _) = connect_async(url).await.expect("Failed to connect");
     println!("WebSocket handshake has been successfully completed");
 
-    let (write, read) = ws_stream.split();
+    let (mut sender, mut receiver) = ws_stream.split();
 
-    let stdin_to_ws = stdin_rx.map(Ok).forward(write);
-    let ws_to_stdout = {
-        read.for_each(|message| async {
-            let data = message.unwrap().into_data();
-            tokio::io::stdout().write_all(&data).await.unwrap();
-        })
-    };
+    for i in 1..3 {
+        // In any websocket error, break loop.
+        if sender
+            .send(Message::Binary(format!("Message number {}...", i).as_bytes().to_vec()))
+            .await
+            .is_err()
+        {
+            //just as with server, if send fails there is nothing we can do but exit.
+            return;
+        }
 
-    pin_mut!(stdin_to_ws, ws_to_stdout);
-    future::select(stdin_to_ws, ws_to_stdout).await;
+        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+    }
+
+    //receiver just prints whatever it gets
+    let mut count = 0;
+    let start = Instant::now();
+    while let Some(Ok(msg)) = receiver.next().await {
+        count += 1;
+        let who = format!("{count} {:?}", start.elapsed());
+        // print message and break if instructed to do so
+        if process_message(msg, who).is_break() {
+            break;
+        }
+    }
 }
 
-// Our helper method which will read data from stdin and send it along the
-// sender provided.
-async fn read_stdin(tx: futures_channel::mpsc::UnboundedSender<Message>) {
-    let mut stdin = tokio::io::stdin();
-    loop {
-        let mut buf = vec![0; 1024];
-        let n = match stdin.read(&mut buf).await {
-            Err(_) | Ok(0) => break,
-            Ok(n) => n,
-        };
-        buf.truncate(n);
-        tx.unbounded_send(Message::binary(buf)).unwrap();
+/// Function to handle messages we get (with a slight twist that Frame variant is visible
+/// since we are working with the underlying tungstenite library directly without axum here).
+fn process_message(msg: Message, who: String) -> ControlFlow<(), ()> {
+    match msg {
+        Message::Text(t) => {
+            println!(">>> {} got str: {:?}", who, t);
+        }
+        Message::Binary(d) => {
+            println!(">>> {} got {} bytes: {:?}", who, d.len(), d);
+        }
+        Message::Close(c) => {
+            if let Some(cf) = c {
+                println!(">>> {} got close with code {} and reason `{}`", who, cf.code, cf.reason);
+            } else {
+                println!(">>> {} somehow got close message without CloseFrame", who);
+            }
+            return ControlFlow::Break(());
+        }
+
+        Message::Pong(v) => {
+            println!(">>> {} got pong with {:?}", who, v);
+        }
+        // Just as with axum server, the underlying tungstenite websocket library
+        // will handle Ping for you automagically by replying with Pong and copying the
+        // v according to spec. But if you need the contents of the pings you can see them here.
+        Message::Ping(v) => {
+            println!(">>> {} got ping with {:?}", who, v);
+        }
+
+        Message::Frame(_) => {
+            unreachable!("This is never supposed to happen")
+        }
     }
+    ControlFlow::Continue(())
 }
